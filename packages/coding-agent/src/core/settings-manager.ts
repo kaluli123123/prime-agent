@@ -262,25 +262,44 @@ export class FileSettingsStorage implements SettingsStorage {
 
 		let release: (() => void) | undefined;
 		try {
-			const fileExists = existsSync(path);
-			if (fileExists) {
+			// Read-only calls (fn always returns undefined, e.g. the startup load path)
+			// must not create the settings file or its directory as a side effect, so
+			// locking stays conditional on the file already existing here, same as
+			// before.
+			const fileExistedBeforeLock = existsSync(path);
+			if (fileExistedBeforeLock) {
 				release = this.acquireLockSyncWithRetry(path);
 			}
-			const current = fileExists ? readFileSync(path, "utf-8") : undefined;
-			const next = fn(current);
+			let current = fileExistedBeforeLock ? readFileSync(path, "utf-8") : undefined;
+			let next = fn(current);
 			if (next !== undefined) {
 				if (!existsSync(dir)) {
 					mkdirSync(dir, { recursive: true });
 				}
 				if (!release) {
 					release = this.acquireLockSyncWithRetry(path);
+					// current was read without holding the lock (the file didn't exist
+					// yet at that point). Another process may have created it while we
+					// were computing next: re-read now that we hold the lock and, if the
+					// on-disk state actually changed, let the caller recompute from the
+					// real current state instead of silently clobbering it with a result
+					// derived from a stale "no prior settings" snapshot (#983). Every
+					// current fn is a pure merge of its `current` argument, safe to
+					// invoke twice.
+					const raceCurrent = existsSync(path) ? readFileSync(path, "utf-8") : undefined;
+					if (raceCurrent !== current) {
+						current = raceCurrent;
+						next = fn(current);
+					}
 				}
-				const temporaryPath = `${path}.${process.pid}.${Date.now()}.tmp`;
-				try {
-					writeFileSync(temporaryPath, next, { encoding: "utf-8", mode: 0o600 });
-					renameSync(temporaryPath, path);
-				} finally {
-					if (existsSync(temporaryPath)) unlinkSync(temporaryPath);
+				if (next !== undefined) {
+					const temporaryPath = `${path}.${process.pid}.${Date.now()}.tmp`;
+					try {
+						writeFileSync(temporaryPath, next, { encoding: "utf-8", mode: 0o600 });
+						renameSync(temporaryPath, path);
+					} finally {
+						if (existsSync(temporaryPath)) unlinkSync(temporaryPath);
+					}
 				}
 			}
 		} finally {

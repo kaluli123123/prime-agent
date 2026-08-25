@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { SettingsManager } from "../src/core/settings-manager.js";
+import { FileSettingsStorage, SettingsManager } from "../src/core/settings-manager.js";
 
 describe("SettingsManager", () => {
 	const testDir = join(process.cwd(), "test-settings-tmp");
@@ -381,6 +381,51 @@ describe("SettingsManager", () => {
 			expect(existsSync(join(projectDir, ".prime", "agent"))).toBe(true);
 
 			expect(existsSync(join(projectDir, ".prime", "agent", "settings.json"))).toBe(true);
+		});
+	});
+
+	describe("concurrent first-write race (#983)", () => {
+		it("re-derives from the real current state instead of clobbering a concurrently created settings file", () => {
+			const projectSettingsPath = join(projectDir, ".prime", "agent", "settings.json");
+			rmSync(join(projectDir, ".prime", "agent"), { recursive: true });
+
+			const storageA = new FileSettingsStorage(projectDir, agentDir);
+			const storageB = new FileSettingsStorage(projectDir, agentDir);
+
+			let callCount = 0;
+			storageA.withLock("project", (current) => {
+				callCount++;
+				if (callCount === 1) {
+					// Simulate a second process racing in and creating the file for
+					// the first time while A's fn is still computing from an
+					// unlocked "current === undefined" read (project settings.json
+					// does not exist yet when both A and B start).
+					storageB.withLock("project", () => JSON.stringify({ fromB: true }, null, 2));
+				}
+				const base = current ? JSON.parse(current) : {};
+				return JSON.stringify({ ...base, fromA: true }, null, 2);
+			});
+
+			// fn was re-invoked once A observed B's write land under the lock,
+			// instead of writing a result computed from a stale "no prior
+			// settings" snapshot.
+			expect(callCount).toBe(2);
+			const finalContent = JSON.parse(readFileSync(projectSettingsPath, "utf-8"));
+			expect(finalContent).toEqual({ fromB: true, fromA: true });
+		});
+
+		it("does not lock or create the directory for a read-only call", () => {
+			rmSync(join(projectDir, ".prime", "agent"), { recursive: true });
+			const storage = new FileSettingsStorage(projectDir, agentDir);
+
+			let sawCurrent: string | undefined = "unset";
+			storage.withLock("project", (current) => {
+				sawCurrent = current;
+				return undefined; // read-only, matches the startup load path
+			});
+
+			expect(sawCurrent).toBeUndefined();
+			expect(existsSync(join(projectDir, ".prime", "agent"))).toBe(false);
 		});
 	});
 

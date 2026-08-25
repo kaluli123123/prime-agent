@@ -42,7 +42,14 @@ export function migrateAuthToAuthJson(): string[] {
 	const migrated: Record<string, unknown> = {};
 	const providers: string[] = [];
 
-	// Migrate oauth.json
+	// Collect credentials from both legacy sources first, without mutating either:
+	// a crash partway through must never destroy a source before auth.json durably
+	// holds its data (see #983 -- the old order renamed oauth.json and dropped
+	// settings.json's apiKeys before auth.json was written, so a crash in between
+	// left nothing to migrate on the next run and every provider credential was
+	// effectively gone).
+	let parsedSettings: { content: string; settings: Record<string, unknown> } | undefined;
+
 	if (existsSync(oauthPath)) {
 		try {
 			const oauth = JSON.parse(readFileSync(oauthPath, "utf-8"));
@@ -50,13 +57,11 @@ export function migrateAuthToAuthJson(): string[] {
 				migrated[provider] = { type: "oauth", ...(cred as object) };
 				providers.push(provider);
 			}
-			renameSync(oauthPath, `${oauthPath}.migrated`);
 		} catch {
 			// Skip on error
 		}
 	}
 
-	// Migrate settings.json apiKeys
 	if (existsSync(settingsPath)) {
 		try {
 			const content = readFileSync(settingsPath, "utf-8");
@@ -68,17 +73,47 @@ export function migrateAuthToAuthJson(): string[] {
 						providers.push(provider);
 					}
 				}
-				delete settings.apiKeys;
-				writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+				parsedSettings = { content, settings };
 			}
 		} catch {
 			// Skip on error
 		}
 	}
 
-	if (Object.keys(migrated).length > 0) {
-		mkdirSync(dirname(authPath), { recursive: true });
-		writeFileSync(authPath, JSON.stringify(migrated, null, 2), { mode: 0o600 });
+	if (Object.keys(migrated).length === 0) {
+		return providers;
+	}
+
+	// Write auth.json durably (temp file + rename) before touching either source: if
+	// this is the last thing that happens before a crash, the next run sees
+	// existsSync(authPath) and skips migration entirely -- the sources are left
+	// as harmless untouched leftovers rather than lost data.
+	const authDir = dirname(authPath);
+	mkdirSync(authDir, { recursive: true });
+	const temporaryAuthPath = join(authDir, `.auth.json.${process.pid}.${Date.now()}.tmp`);
+	try {
+		writeFileSync(temporaryAuthPath, JSON.stringify(migrated, null, 2), { mode: 0o600 });
+		renameSync(temporaryAuthPath, authPath);
+	} finally {
+		if (existsSync(temporaryAuthPath)) rmSync(temporaryAuthPath, { force: true });
+	}
+
+	// Only now clean up the sources auth.json's data was migrated from.
+	if (existsSync(oauthPath)) {
+		try {
+			renameSync(oauthPath, `${oauthPath}.migrated`);
+		} catch {
+			// Non-fatal: auth.json already has the data; a leftover oauth.json is
+			// harmless (existsSync(authPath) short-circuits migration next run).
+		}
+	}
+	if (parsedSettings) {
+		try {
+			delete parsedSettings.settings.apiKeys;
+			writeFileSync(settingsPath, JSON.stringify(parsedSettings.settings, null, 2));
+		} catch {
+			// Non-fatal, same reasoning as above.
+		}
 	}
 
 	return providers;

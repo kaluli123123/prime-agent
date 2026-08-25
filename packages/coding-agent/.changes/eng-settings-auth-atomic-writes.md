@@ -1,0 +1,1 @@
+- Fixed settings.json and auth.json writes that could silently lose all settings or credentials on a crash or concurrent write, and reordered the legacy auth migration to write auth.json durably before touching its sources.
