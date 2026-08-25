@@ -151,6 +151,10 @@ export function transformMessages<TApi extends Api>(
 	const result: Message[] = [];
 	let pendingToolCalls: ToolCall[] = [];
 	let existingToolResultIds = new Set<string>();
+	// Tool-call ids from an assistant message that was just dropped because its
+	// turn errored or was aborted. Any `toolResult` for one of these ids has no
+	// surviving tool call to pair with, so it must be dropped too (see #984).
+	let orphanedToolCallIds = new Set<string>();
 	const insertSyntheticToolResults = () => {
 		if (pendingToolCalls.length > 0) {
 			for (const tc of pendingToolCalls) {
@@ -183,8 +187,11 @@ export function transformMessages<TApi extends Api>(
 			// - The model should retry from the last valid state
 			const assistantMsg = msg as AssistantMessage;
 			if (assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") {
+				const droppedToolCalls = assistantMsg.content.filter((b) => b.type === "toolCall") as ToolCall[];
+				orphanedToolCallIds = new Set(droppedToolCalls.map((tc) => tc.id));
 				continue;
 			}
+			orphanedToolCallIds = new Set();
 
 			const toolCalls = assistantMsg.content.filter((b) => b.type === "toolCall") as ToolCall[];
 			if (toolCalls.length > 0) {
@@ -194,6 +201,11 @@ export function transformMessages<TApi extends Api>(
 
 			result.push(msg);
 		} else if (msg.role === "toolResult") {
+			// A result whose parent tool call was just dropped as part of an
+			// errored/aborted turn has nothing to pair with; drop it too.
+			if (orphanedToolCallIds.has(msg.toolCallId)) {
+				continue;
+			}
 			existingToolResultIds.add(msg.toolCallId);
 			result.push(msg);
 		} else if (msg.role === "user") {

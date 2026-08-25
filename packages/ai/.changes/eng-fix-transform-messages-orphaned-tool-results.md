@@ -1,0 +1,1 @@
+- Fixed a retry after an aborted or errored tool turn sending an orphaned tool result with no matching tool call, which providers reject.
